@@ -15,6 +15,20 @@ function packFlagsUint8(...flags: number[]): number {
     return packed & 0xff;
 }
 
+function packFlagsAndFloatUint8(value: number, ...flags: number[]): number {
+    let packed = 0;
+    let shift = 7;
+    for (let i = 0, n = Math.min(flags.length, 8); i < n; ++i) {
+        packed |= Number(flags[i]) << shift;
+        --shift;
+    }
+
+    // unpacking fails if all bits are set
+    packed |= Math.min(0xfe, Math.max(0, Math.floor(value * 0xff))) >> (7 - shift);
+
+    return packed & 0xff;
+}
+
 function generatePermutations(dim: number): number[][] {
     const out: number[][] = [];
     for (let i = 0; i < 2**dim; i++) {
@@ -53,23 +67,28 @@ function generateTestData(
     const permutations = generatePermutations(count);
     const s: string[] = [];
 
+    const colCount = Math.ceil(permutations.length / Math.max(1, count));
+    // const rowCount = Math.ceil(permutations.length / colCount)
+    const quadSize = (size - (colCount + 1) * padding) / colCount;
+
     for (const [index, flags] of permutations.entries()) {
-        const row = count - 1 - Math.floor(index / count);
-        const col = index % count;
-        const quadSize = (size - (count + 1) * padding) / count;
+        const row = colCount - 1 - Math.floor(index / colCount);
+        const col = index % colCount;
         const x = padding * (col + 1) + col * quadSize + 0.5 * quadSize - 0.5 * size;
         const y = padding * (row + 1) + row * quadSize + 0.5 * quadSize - 0.5 * size;
         outPositions.push(...quad(x, y, quadSize));
 
-        const packed0 = packFlagsUint8(...flags, 0);
-        const packed1 = packFlagsUint8(...flags, 1);
+        // const packed0 = packFlagsUint8(...flags, 0);
+        // const packed1 = packFlagsUint8(...flags, 1);
+        const packed0 = packFlagsAndFloatUint8(0.0, ...flags);
+        const packed1 = packFlagsAndFloatUint8(1.0, ...flags);
         // outFlags.push(packed0, packed1, packed0, packed0, packed1, packed0);
         // outFlags.push(packed1, packed0, packed1, packed1, packed0, packed1);
         // outFlags.push(packed0, packed1, packed1, packed1, packed0, packed0);
         outFlags.push(packed1, packed0, packed0, packed0, packed1, packed1);
 
         s.push(flags.join(' '));
-        if ((index + 1) % count === 0) {
+        if ((index + 1) % colCount === 0) {
             console.log(s.join(' | '));
             s.length = 0;
         }
@@ -84,7 +103,8 @@ function generateTestData(
     return [outPositions, outFlags, outIndices];
 }
 
-const [positions, flags, indices] = generateTestData(3);
+const flagCount = 3;
+const [positions, flags, indices] = generateTestData(flagCount);
 
 const positionsBuffer = gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, positionsBuffer);
@@ -125,7 +145,64 @@ if (vertCompilationLog) {
     console.log(`Vertex shader compiler log:\n${vertCompilationLog}`);
 }
 
-const fragCode = `\
+const fragCode = [
+// 0 flags + 1 continuous
+`\
+precision highp float;
+
+varying float vFlags;
+
+void unpackFlags0alpha(float encoded, out float a) {
+    // a = encoded * 2.0;
+    a = encoded;
+}
+
+void main() {
+    float alpha;
+    unpackFlags0alpha(vFlags, alpha);
+    // gl_FragColor = vec4(1.0, 1.0, 1.0, alpha);
+    gl_FragColor = vec4(alpha, alpha, alpha, 1.0);
+}
+`,
+// 1 flags + 1 continuous
+`\
+precision highp float;
+
+varying float vFlags;
+
+void unpackFlags1alpha(float encoded, out float a, out float b) {
+    a = floor(encoded * 2.0);
+    // b = encoded * 4.0 - a * 2.0;
+    b = encoded * 2.0 - a;
+}
+
+void main() {
+    float a, alpha;
+    unpackFlags1alpha(vFlags, a, alpha);
+    gl_FragColor = vec4(a, 0.0, 0.0, alpha);
+}
+`,
+// 2 flags + 1 continuous
+`\
+precision highp float;
+
+varying float vFlags;
+
+void unpackFlags2alpha(float encoded, out float a, out float b, out float c) {
+    a = floor(encoded * 2.0);
+    b = floor(encoded * 4.0) - a * 2.0;
+    // c = encoded * 8.0 - a * 4.0 - b * 2.0;
+    c = encoded * 4.0 - a * 2.0 - b;
+}
+
+void main() {
+    float a, b, alpha;
+    unpackFlags2alpha(vFlags, a, b, alpha);
+    gl_FragColor = vec4(a, b, 0.0, alpha);
+}
+`,
+// 3 flags + 1 continuous
+`\
 precision highp float;
 
 varying float vFlags;
@@ -134,7 +211,8 @@ void unpackFlags3alpha(float encoded, out float a, out float b, out float c, out
     a = floor(encoded * 2.0);
     b = floor(encoded * 4.0) - a * 2.0;
     c = floor(encoded * 8.0) - a * 4.0 - b * 2.0;
-    d = encoded * 16.0 - a * 8.0 - b * 4.0 - c * 2.0;
+    // d = encoded * 16.0 - a * 8.0 - b * 4.0 - c * 2.0;
+    d = encoded * 8.0 - a * 4.0 - b * 2.0 - c;
 }
 
 void main() {
@@ -143,10 +221,11 @@ void main() {
     gl_FragColor = vec4(a, b, c, alpha);
     // gl_FragColor = vec4(vec3(a, b, c) * alpha, 1.0);
 }
-`;
+`,
+];
 
 const fragShader = gl.createShader(gl.FRAGMENT_SHADER)!;
-gl.shaderSource(fragShader, fragCode);
+gl.shaderSource(fragShader, fragCode[flagCount]);
 gl.compileShader(fragShader);
 const fragCompilationLog = gl.getShaderInfoLog(fragShader);
 if (fragCompilationLog) {
@@ -175,7 +254,7 @@ gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
 
 // rendering
 
-gl.clearColor(0.9, 0.9, 0.9, 1.0);
+gl.clearColor(0.5, 0.5, 0.5, 1.0);
 gl.enable(gl.DEPTH_TEST);
 gl.clear(gl.COLOR_BUFFER_BIT);
 gl.viewport(0, 0, canvas.width, canvas.height);
